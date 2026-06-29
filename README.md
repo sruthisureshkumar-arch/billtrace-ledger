@@ -1,6 +1,6 @@
 # BillTrace Ledger — Smart Expense & Bill Management System
 
-**Developed by — Sruthi Sureshkumar and Thaarini **
+Developed by - Sruthi Sureshkumar and Thaarini 
 
 BillTrace Ledger is a full-stack expense and bill management platform designed to simplify personal financial tracking. It enables users to securely record income and expenses, organize transactions into categories, monitor spending habits, and visualize financial insights through an intuitive dashboard.
 
