@@ -1,15 +1,75 @@
+import io
 import json
 import os
 import random
+import re
 import secrets
+import time
 from datetime import datetime, timedelta
+from functools import wraps
 from pathlib import Path
 
 from flask import Flask, jsonify, redirect, render_template, request, session, url_for
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from werkzeug.security import check_password_hash, generate_password_hash
 
 app = Flask(__name__)
-app.secret_key = secrets.token_hex(32)
+
+# Use a stable secret key from environment so sessions survive restarts.
+# On first deploy, set FLASK_SECRET_KEY in Azure App Service → Configuration.
+app.secret_key = os.environ.get("FLASK_SECRET_KEY") or secrets.token_hex(32)
+
+# ---- Security config ----
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10 MB upload limit
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+
+# ---- Rate limiter ----
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["300 per day", "60 per hour"],
+    storage_uri="memory://",
+)
+
+# ---- Security headers on every response ----
+@app.after_request
+def set_security_headers(response):
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
+
+# ---- Error handlers ----
+@app.errorhandler(413)
+def upload_too_large(e):
+    return jsonify({"error": "File too large. Maximum size is 10 MB."}), 413
+
+@app.errorhandler(429)
+def rate_limited(e):
+    return jsonify({"error": "Too many requests. Please wait and try again."}), 429
+
+# ---- Auth decorator ----
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if "username" not in session:
+            return jsonify({"error": "Authentication required."}), 401
+        return f(*args, **kwargs)
+    return decorated
+
+# ---- Image validation (magic bytes — not just extension) ----
+_IMAGE_SIGNATURES = [
+    b"\xff\xd8\xff",           # JPEG
+    b"\x89PNG\r\n\x1a\n",     # PNG
+    b"RIFF",                   # WebP (bytes 0-3; bytes 8-11 = "WEBP")
+    b"GIF8",                   # GIF
+]
+
+def _is_valid_image(data: bytes) -> bool:
+    return any(data.startswith(sig) for sig in _IMAGE_SIGNATURES)
 
 LEDGER_FILE = Path(__file__).parent / "ledger.json"
 USERS_FILE = Path(__file__).parent / "users.json"
@@ -75,11 +135,77 @@ def save_users(users: dict) -> None:
 
 registered_users: dict = load_users()
 
-def simulate_ocr(has_image: bool, manual_serial=None):
-    
+def _azure_vision_ocr(image_bytes: bytes) -> str:
+    """Extract serial number from a currency note image using Azure Computer Vision."""
+    key = os.environ.get("AZURE_VISION_KEY", "")
+    endpoint = os.environ.get("AZURE_VISION_ENDPOINT", "")
+
+    if not key or not endpoint:
+        app.logger.warning("Azure Vision credentials not set — falling back to dummy serial.")
+        return ""
+
+    try:
+        from azure.cognitiveservices.vision.computervision import ComputerVisionClient
+        from azure.cognitiveservices.vision.computervision.models import OperationStatusCodes
+        from msrest.authentication import CognitiveServicesCredentials
+
+        client = ComputerVisionClient(endpoint.rstrip("/"), CognitiveServicesCredentials(key))
+        stream = io.BytesIO(image_bytes)
+
+        read_response = client.read_in_stream(stream, raw=True)
+        operation_id = read_response.headers["Operation-Location"].split("/")[-1]
+
+        # Poll until complete (max ~10 s)
+        for _ in range(10):
+            result = client.get_read_result(operation_id)
+            if result.status not in [OperationStatusCodes.running, OperationStatusCodes.not_started]:
+                break
+            time.sleep(1)
+
+        if result.status != OperationStatusCodes.succeeded:
+            return ""
+
+        # Collect every line of text Azure found
+        lines = []
+        for page in result.analyze_result.read_results:
+            for line in page.lines:
+                lines.append(line.text.strip().upper())
+
+        full_text = " ".join(lines)
+
+        # Try to match common currency serial patterns first
+        # US Federal Reserve notes: letter + 8 digits + letter  e.g. "A12345678B"
+        # Some notes: 2 letters + 8 digits  e.g. "AB12345678"
+        patterns = [
+            r'\b[A-Z]\d{8}[A-Z]\b',      # classic US format
+            r'\b[A-Z]{2}\d{8}\b',          # alternate format
+            r'\b[A-Z0-9]{8,12}\b',         # generic fallback
+        ]
+        for pattern in patterns:
+            matches = re.findall(pattern, full_text)
+            if matches:
+                return max(matches, key=len)[:20]
+
+        # Last resort: longest alphanumeric token ≥ 4 chars
+        tokens = re.findall(r'[A-Z0-9]{4,}', full_text)
+        if tokens:
+            return max(tokens, key=len)[:20]
+
+        return ""
+
+    except Exception as exc:
+        app.logger.warning(f"Azure Vision OCR error: {exc}")
+        return ""
+
+
+def simulate_ocr(has_image: bool, image_bytes: bytes = None, manual_serial=None):
     if manual_serial and manual_serial.strip():
         return "".join(c for c in manual_serial.strip().upper() if c.isalnum())[:20]
-    if has_image:
+    if has_image and image_bytes:
+        extracted = _azure_vision_ocr(image_bytes)
+        if extracted:
+            return extracted
+        # Azure not configured — fall back to a dummy serial for demo purposes
         return random.choice(DUMMY_SERIALS)
     return ""
 
@@ -184,6 +310,7 @@ def login_page():
 
 
 @app.route("/api/register", methods=["POST"])
+@limiter.limit("5 per minute")
 def register():
     data = request.get_json(silent=True) or {}
     username = data.get("username", "").strip()
@@ -209,6 +336,7 @@ def register():
 
 
 @app.route("/api/login", methods=["POST"])
+@limiter.limit("10 per minute")
 def login():
     data = request.get_json(silent=True) or {}
     username = data.get("username", "").strip()
@@ -232,8 +360,16 @@ def logout():
 
 
 @app.route("/api/process", methods=["POST"])
+@login_required
+@limiter.limit("15 per minute")
 def process_scan():
+    image_bytes = None
     has_image = "image" in request.files and request.files["image"].filename != ""
+    if has_image:
+        image_bytes = request.files["image"].read()
+        if not _is_valid_image(image_bytes):
+            return jsonify({"error": "Invalid file type. Please upload a JPEG, PNG, or WebP image."}), 400
+
     manual_serial = request.form.get("serial", "").strip()
     location_index_str = request.form.get("location_index", "")
 
@@ -241,7 +377,7 @@ def process_scan():
     if location_index_str.isdigit():
         location_index = int(location_index_str)
 
-    serial = simulate_ocr(has_image, manual_serial if manual_serial else None)
+    serial = simulate_ocr(has_image, image_bytes, manual_serial if manual_serial else None)
 
     if not serial:
         return jsonify({"error": "No serial number could be extracted. Please upload an image or enter a serial number manually."}), 400
@@ -255,6 +391,8 @@ def process_scan():
 
 
 @app.route("/api/history", methods=["GET"])
+@login_required
+@limiter.limit("30 per minute")
 def get_history():
     history = []
     for serial, scans in all_scanned_bills.items():
@@ -277,6 +415,8 @@ def get_locations():
 
 
 @app.route("/api/reset", methods=["POST"])
+@login_required
+@limiter.limit("5 per minute")
 def reset_ledger():
     global all_scanned_bills
     all_scanned_bills = {}

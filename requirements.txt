@@ -1,2 +1,5 @@
 flask>=3.0
 gunicorn
+flask-limiter
+azure-cognitiveservices-vision-computervision
+msrest
