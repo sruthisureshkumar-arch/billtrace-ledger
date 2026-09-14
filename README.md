@@ -42,7 +42,7 @@ The dashboard provides a quick overview of financial activity, including:
 
 | Layer          | Technology                                    |
 | -------------- | --------------------------------------------- |
-| Frontend       | React.js                                      |
+| Frontend       | FLASK API (Jinja 2)                           |
 | Backend        | Node.js, Express.js                           |
 | Database       | MongoDB (Mongoose)                            |
 | Authentication | JWT, bcryptjs                                 |
